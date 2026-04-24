@@ -41,7 +41,7 @@ def find_f3d():
 
 
 def already_processed(stem: str) -> bool:
-    return (OUTPUT_DIR / f"{stem}.stl").exists()
+    return (OUTPUT_DIR / stem / f"{stem}.stl").exists()
 
 
 def generate_glb(image_path: Path) -> bytes:
@@ -94,9 +94,10 @@ def open_f3d(*paths: Path):
 
 def process_image(image_path: Path) -> Path | None:
     stem = image_path.stem
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    glb_out = OUTPUT_DIR / f"{stem}.glb"
-    stl_out = OUTPUT_DIR / f"{stem}.stl"
+    out_dir = OUTPUT_DIR / stem
+    out_dir.mkdir(parents=True, exist_ok=True)
+    glb_out = out_dir / f"{stem}.glb"
+    stl_out = out_dir / f"{stem}.stl"
 
     print(f"\n→ {image_path.name}")
 
