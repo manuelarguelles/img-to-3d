@@ -11,7 +11,6 @@ import os
 import shutil
 import argparse
 import subprocess
-import tempfile
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -30,9 +29,6 @@ SLAT_STEPS    = 12
 MESH_SIMPLIFY = 0.95
 TEXTURE_SIZE  = 1024
 
-# Si ancho/alto > este umbral, se asume multi-view horizontal
-MULTIVIEW_RATIO = 1.8
-
 F3D_CANDIDATES = [
     shutil.which("f3d"),
     "/opt/homebrew/bin/f3d",
@@ -48,48 +44,18 @@ def already_processed(stem: str) -> bool:
     return (OUTPUT_DIR / f"{stem}.stl").exists()
 
 
-def detect_views(image_path: Path) -> list[Path]:
-    """
-    Si la imagen es un composite multi-view (ratio > MULTIVIEW_RATIO),
-    la corta en N vistas iguales y devuelve los paths temporales.
-    Si es imagen simple, devuelve [image_path] sin tocar nada.
-    """
-    from PIL import Image
-
-    img = Image.open(image_path)
-    w, h = img.size
-    ratio = w / h
-
-    n_views = round(ratio)  # 1 → single, 2 → dos vistas, 3 → tres vistas
-    if ratio < MULTIVIEW_RATIO or n_views < 2:
-        print(f"  Imagen simple ({w}×{h})")
-        return [image_path]
-
-    print(f"  Multi-view detectado ({w}×{h}, ratio {ratio:.2f} → {n_views} vistas)")
-    view_w = w // n_views
-    tmp_dir = Path(tempfile.mkdtemp())
-    paths = []
-    for i in range(n_views):
-        crop = img.crop((i * view_w, 0, (i + 1) * view_w, h))
-        out = tmp_dir / f"{image_path.stem}_view{i}.png"
-        crop.save(out)
-        paths.append(out)
-    return paths
-
-
-def generate_glb(image_paths: list[Path]) -> bytes:
+def generate_glb(image_path: Path) -> bytes:
     import replicate
     token = os.environ.get("REPLICATE_API_TOKEN")
     if not token:
         print("Error: REPLICATE_API_TOKEN no encontrado en .env")
         sys.exit(1)
     client = replicate.Client(api_token=token)
-    handles = [open(p, "rb") for p in image_paths]
-    try:
+    with open(image_path, "rb") as f:
         output = client.run(
             REPLICATE_MODEL,
             input={
-                "images": handles,
+                "images": [f],
                 "texture_size": TEXTURE_SIZE,
                 "mesh_simplify": MESH_SIMPLIFY,
                 "generate_model": True,
@@ -102,9 +68,6 @@ def generate_glb(image_paths: list[Path]) -> bytes:
                 "slat_sampling_steps": SLAT_STEPS,
             },
         )
-    finally:
-        for f in handles:
-            f.close()
     return output["model_file"].read()
 
 
@@ -141,17 +104,11 @@ def process_image(image_path: Path) -> Path | None:
         print(f"  [skip] {stem}.stl ya existe en /output")
         return stl_out
 
-    print("  [1/4] Analizando imagen...")
-    views = detect_views(image_path)
-
-    print(f"  [2/4] Enviando {len(views)} vista(s) a Replicate TRELLIS...")
-    glb_bytes = generate_glb(views)
-
-    print("  [3/4] Guardando GLB...")
-    glb_out.write_bytes(glb_bytes)
+    print("  [1/3] Enviando a Replicate TRELLIS...")
+    glb_out.write_bytes(generate_glb(image_path))
     print(f"  GLB: {glb_out.name}  ({glb_out.stat().st_size // 1024} KB)")
 
-    print("  [4/4] Convirtiendo a STL unificado...")
+    print("  [2/3] Convirtiendo a STL...")
     glb_to_stl(glb_out, stl_out)
 
     return stl_out
@@ -179,7 +136,7 @@ def batch(view: bool):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Imagen → TRELLIS → GLB + STL unificado → f3d")
+    parser = argparse.ArgumentParser(description="Imagen → TRELLIS → GLB + STL → f3d")
     parser.add_argument("image", nargs="?", help="Imagen a procesar (omitir = batch desde /raw)")
     parser.add_argument("--no-view", action="store_true", help="No abrir en f3d")
     args = parser.parse_args()
