@@ -108,9 +108,10 @@ def process_image(image_path: Path) -> Path | None:
     glb_out.write_bytes(generate_glb(image_path))
     print(f"  GLB: {glb_out.name}  ({glb_out.stat().st_size // 1024} KB)")
 
-    print("  [2/3] Convirtiendo a STL...")
+    print("  [2/3] Convirtiendo a STL unificado...")
     glb_to_stl(glb_out, stl_out)
 
+    print(f"  Output: {glb_out.name} + {stl_out.name}")
     return stl_out
 
 
