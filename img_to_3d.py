@@ -1,140 +1,154 @@
 #!/usr/bin/env python3
-"""img-to-3d: Image → TRELLIS → GLB/STL → f3d viewer"""
+"""img-to-3d: Image → TRELLIS (Replicate) → GLB + STL → f3d viewer
+
+Modes:
+  Batch: python img_to_3d.py          → procesa todo /raw, salta ya procesados
+  Single: python img_to_3d.py <image> → procesa una imagen específica
+"""
 
 import sys
 import os
 import shutil
 import argparse
 import subprocess
-import tempfile
 from pathlib import Path
-from gradio_client import Client, handle_file
+from dotenv import load_dotenv
 
-OUTPUT_DIR = Path.home() / "Downloads" / "img-to-3d"
-HF_SPACE = "trellis-community/trellis"
+load_dotenv(Path(__file__).parent / ".env")
 
-# TRELLIS preprocess + generation defaults
-PREPROCESS_BACKGROUND = True
-SEED = 1
-SS_GUIDANCE = 7.5
-SS_STEPS = 12
+REPO_DIR      = Path(__file__).parent
+RAW_DIR       = REPO_DIR / "raw"
+OUTPUT_DIR    = REPO_DIR / "output"
+REPLICATE_MODEL = "firtoz/trellis:e8f6c45206993f297372f5436b90350817bd9b4a0d52d2a76df50c1c8afa2b3c"
+IMAGE_EXTS    = {".jpg", ".jpeg", ".png", ".webp"}
+
+SS_GUIDANCE   = 7.5
+SS_STEPS      = 12
 SLAT_GUIDANCE = 3.0
-SLAT_STEPS = 12
+SLAT_STEPS    = 12
 MESH_SIMPLIFY = 0.95
-TEXTURE_SIZE = 1024
+TEXTURE_SIZE  = 1024
+
+F3D_CANDIDATES = [
+    shutil.which("f3d"),
+    "/opt/homebrew/bin/f3d",
+    "/opt/homebrew/var/homebrew/tmp/.cellar/f3d/3.5.0/bin/f3d",
+    "/usr/local/bin/f3d",
+]
 
 
-def preprocess(client: Client, image_path: str) -> str:
-    result = client.predict(
-        image=handle_file(image_path),
-        prepro_ckpt="none",
-        background_choice="Auto Remove Background" if PREPROCESS_BACKGROUND else "Original Image",
-        foreground_ratio=0.85,
-        seed=SEED,
-        randomize_seed=False,
-        api_name="/preprocess_image",
-    )
-    # result may be a path or (path, seed) tuple
-    if isinstance(result, (list, tuple)):
-        preprocessed_path = result[0]
-        seed_used = result[1] if len(result) > 1 else SEED
-    else:
-        preprocessed_path = result
-        seed_used = SEED
-    return preprocessed_path, seed_used
+def find_f3d():
+    return next((p for p in F3D_CANDIDATES if p and os.path.isfile(p)), None)
 
 
-def generate(client: Client, preprocessed_path: str, seed: int) -> str:
-    result = client.predict(
-        image=handle_file(preprocessed_path),
-        seed=seed,
-        randomize_seed=False,
-        ss_guidance_strength=SS_GUIDANCE,
-        ss_sampling_steps=SS_STEPS,
-        slat_guidance_strength=SLAT_GUIDANCE,
-        slat_sampling_steps=SLAT_STEPS,
-        multiimage_algo="stochastic",
-        api_name="/image_to_3d",
-    )
-    return result  # returns video preview + 3D state
+def already_processed(stem: str) -> bool:
+    return (OUTPUT_DIR / f"{stem}.stl").exists()
 
 
-def extract_glb(client: Client, state) -> Path:
-    result = client.predict(
-        mesh_simplify=MESH_SIMPLIFY,
-        texture_size=TEXTURE_SIZE,
-        api_name="/extract_glb",
-    )
-    if isinstance(result, (list, tuple)):
-        glb_path = result[0]
-    else:
-        glb_path = result
-    return Path(glb_path)
+def generate_glb(image_path: Path) -> bytes:
+    import replicate
+    token = os.environ.get("REPLICATE_API_TOKEN")
+    if not token:
+        print("Error: REPLICATE_API_TOKEN no encontrado en .env")
+        sys.exit(1)
+    client = replicate.Client(api_token=token)
+    with open(image_path, "rb") as f:
+        output = client.run(
+            REPLICATE_MODEL,
+            input={
+                "images": [f],
+                "texture_size": TEXTURE_SIZE,
+                "mesh_simplify": MESH_SIMPLIFY,
+                "generate_model": True,
+                "generate_color": True,
+                "randomize_seed": False,
+                "seed": 1,
+                "ss_guidance_strength": SS_GUIDANCE,
+                "ss_sampling_steps": SS_STEPS,
+                "slat_guidance_strength": SLAT_GUIDANCE,
+                "slat_sampling_steps": SLAT_STEPS,
+            },
+        )
+    return output["model_file"].read()
 
 
-def to_stl(glb_path: Path, stl_path: Path):
-    try:
-        import trimesh
-        mesh = trimesh.load(str(glb_path), force="mesh")
-        mesh.export(str(stl_path))
-        print(f"  STL: {stl_path.stat().st_size // 1024} KB  |  faces: {len(mesh.faces)}")
-    except ImportError:
-        print("  [aviso] trimesh no instalado — solo se genera el GLB")
+def glb_to_stl(glb_path: Path, stl_path: Path):
+    import trimesh
+    mesh = trimesh.load(str(glb_path), force="mesh")
+    mesh.export(str(stl_path))
+    print(f"  STL: {stl_path.name}  ({stl_path.stat().st_size // 1024} KB, {len(mesh.faces)} caras)")
 
 
 def open_f3d(path: Path):
-    f3d = shutil.which("f3d")
+    f3d = find_f3d()
     if not f3d:
-        print("  f3d no encontrado. Instalar con: brew install f3d")
+        print("  f3d no encontrado — instalar con: brew install f3d")
         return
     subprocess.Popen([f3d, str(path)])
     print(f"  Abriendo en f3d: {path.name}")
 
 
-def run(image_path: str, output_name: str | None, stl: bool, view: bool):
-    image_path = os.path.expanduser(image_path)
-    if not os.path.exists(image_path):
-        print(f"Error: no se encuentra la imagen: {image_path}")
-        sys.exit(1)
-
-    stem = output_name or Path(image_path).stem
+def process_image(image_path: Path, view: bool = True):
+    stem = image_path.stem
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     glb_out = OUTPUT_DIR / f"{stem}.glb"
     stl_out = OUTPUT_DIR / f"{stem}.stl"
 
-    print(f"[1/4] Conectando a TRELLIS ({HF_SPACE})...")
-    client = Client(HF_SPACE)
+    print(f"\n→ {image_path.name}")
 
-    print("[2/4] Preprocesando imagen...")
-    preprocessed, seed = preprocess(client, image_path)
+    if already_processed(stem):
+        print(f"  [skip] {stem}.stl ya existe en /output")
+        return stl_out
 
-    print("[3/4] Generando modelo 3D...")
-    state = generate(client, preprocessed, seed)
+    print("  [1/3] Enviando a Replicate TRELLIS...")
+    glb_bytes = generate_glb(image_path)
 
-    print("[4/4] Extrayendo GLB...")
-    tmp_glb = extract_glb(client, state)
-    shutil.copy(tmp_glb, glb_out)
-    print(f"  GLB: {glb_out}  ({glb_out.stat().st_size // 1024} KB)")
+    print("  [2/3] Guardando GLB...")
+    glb_out.write_bytes(glb_bytes)
+    print(f"  GLB: {glb_out.name}  ({glb_out.stat().st_size // 1024} KB)")
 
-    view_target = glb_out
-    if stl:
-        to_stl(glb_out, stl_out)
-        view_target = stl_out
+    print("  [3/3] Convirtiendo a STL...")
+    glb_to_stl(glb_out, stl_out)
 
     if view:
-        open_f3d(view_target)
+        open_f3d(stl_out)
+
+    return stl_out
+
+
+def batch(view: bool):
+    images = sorted(p for p in RAW_DIR.iterdir() if p.suffix.lower() in IMAGE_EXTS)
+    if not images:
+        print(f"No hay imágenes en {RAW_DIR}")
+        return
+
+    pending = [img for img in images if not already_processed(img.stem)]
+    skipped = len(images) - len(pending)
+
+    print(f"Encontradas: {len(images)} imágenes  |  pendientes: {len(pending)}  |  ya procesadas: {skipped}")
+
+    for img in pending:
+        process_image(img, view=view)
 
     print(f"\nListo. Archivos en {OUTPUT_DIR}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Imagen → TRELLIS → 3D → f3d")
-    parser.add_argument("image", help="Ruta a la imagen fuente")
-    parser.add_argument("-n", "--name", help="Nombre base del archivo de salida")
-    parser.add_argument("--stl", action="store_true", help="Exportar también a STL")
+    parser = argparse.ArgumentParser(description="Imagen → TRELLIS → GLB + STL → f3d")
+    parser.add_argument("image", nargs="?", help="Imagen a procesar (omitir = batch desde /raw)")
     parser.add_argument("--no-view", action="store_true", help="No abrir en f3d")
     args = parser.parse_args()
-    run(args.image, args.name, args.stl, not args.no_view)
+
+    view = not args.no_view
+
+    if args.image:
+        image_path = Path(os.path.expanduser(args.image))
+        if not image_path.exists():
+            print(f"Error: no se encuentra {image_path}")
+            sys.exit(1)
+        process_image(image_path, view=view)
+    else:
+        batch(view=view)
 
 
 if __name__ == "__main__":
