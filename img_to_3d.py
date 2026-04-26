@@ -83,6 +83,40 @@ def glb_to_stl(glb_path: Path, stl_path: Path):
     print(f"  STL: {stl_path.name}  ({stl_path.stat().st_size // 1024} KB, {len(mesh.faces)} caras)")
 
 
+REPAIR_PY = Path(__file__).parent / ".venv312" / "bin" / "python"
+
+_REPAIR_SCRIPT = """
+import sys, trimesh, pymeshfix, numpy as np
+path = sys.argv[1]
+mesh = trimesh.load(path, force='mesh')
+if mesh.is_watertight:
+    print(f"  [ok] watertight ({len(mesh.faces)} caras)")
+    sys.exit(0)
+print(f"  [repair] non-watertight ({len(mesh.faces)} caras) → reparando con pymeshfix...")
+mf = pymeshfix.MeshFix(np.array(mesh.vertices, dtype=np.float32), np.array(mesh.faces, dtype=np.int32))
+mf.repair(joincomp=True)
+fixed = trimesh.Trimesh(vertices=mf.points, faces=mf.faces, process=False)
+fixed.merge_vertices()
+status = "watertight" if fixed.is_watertight else "aun no-watertight"
+print(f"  [repair] {status} — {len(fixed.faces)} caras, vol={fixed.volume:.2f}")
+fixed.export(path)
+"""
+
+
+def repair_stl(stl_path: Path):
+    if not REPAIR_PY.exists():
+        print("  [repair] .venv312 no encontrado — salteando reparación")
+        return
+    result = subprocess.run(
+        [str(REPAIR_PY), "-c", _REPAIR_SCRIPT, str(stl_path)],
+        capture_output=True, text=True,
+    )
+    if result.stdout:
+        print(result.stdout.rstrip())
+    if result.returncode != 0 and result.stderr:
+        print(f"  [repair] error: {result.stderr.rstrip()}")
+
+
 def open_f3d(*paths: Path):
     f3d = find_f3d()
     if not f3d:
@@ -111,6 +145,9 @@ def process_image(image_path: Path) -> Path | None:
 
     print("  [2/3] Convirtiendo a STL unificado...")
     glb_to_stl(glb_out, stl_out)
+
+    print("  [3/3] Validando y reparando malla...")
+    repair_stl(stl_out)
 
     print(f"  Output: {glb_out.name} + {stl_out.name}")
     return stl_out
